@@ -9,7 +9,7 @@ const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY;
 const PROJECT_ID = process.env.PROJECT_ID;
 const bucket = process.env.BUCKET;
 const endpoint = process.env.S3_ENDPOINT;
-// const gitUrl = process.env.GIT_REPOSITORY_URL;
+
 // const publisher = new Redis("redis://localhost:2739");
 
 if (!accessKeyId || !secretAccessKey || !bucket || !endpoint) {
@@ -78,8 +78,8 @@ const init = async () => {
 
       await s3Client.send(command);
 
-      console.log("Uploading done!... ", file);
     }
+    console.log("Uploading done!... ");
 
   });
 };
