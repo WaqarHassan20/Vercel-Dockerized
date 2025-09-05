@@ -1,0 +1,19 @@
+{
+  "name": "s3-reverse-proxy",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.883.0",
+    "@types/express": "^5.0.3",
+    "@types/http-proxy": "^1.17.16",
+    "express": "^5.1.0",
+    "http-proxy": "^1.18.1"
+  }
+}
