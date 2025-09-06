@@ -1,13 +1,16 @@
 import express from "express";
 import httpProxy from "http-proxy";
 
-const PORT = 8000;
 const app = express();
 const proxy = httpProxy.createProxyServer();
 
 // I am not sure about this link , so have to test it later on 
 const BASE_PATH = process.env.BASE_PATH;
+const PORT = process.env.PORT;
 
+if (!PORT) {
+  throw new Error("PORT is not provided");
+}
 if (!BASE_PATH) {
   throw new Error("BASE PATH is not provided");
 }
