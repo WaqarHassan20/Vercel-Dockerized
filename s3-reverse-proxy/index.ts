@@ -6,11 +6,16 @@ const app = express();
 const proxy = httpProxy.createProxyServer();
 
 // I am not sure about this link , so have to test it later on 
-const BASE_PATH ="https://pub-c7d0a525478f4e4abe807b76eb8253ce.r2.dev/vercel/__outputs/"
-  
+const BASE_PATH = process.env.BASE_PATH;
+
+if (!BASE_PATH) {
+  throw new Error("BASE PATH is not provided");
+}
+
 app.use((req, res) => {
   const hostname = req.host;
   const projectId = hostname.split(".")[0];
+  console.log("Project Id : ", projectId);
 
   // When request is only / , make this /index.html
   if (req.path === "/") {
