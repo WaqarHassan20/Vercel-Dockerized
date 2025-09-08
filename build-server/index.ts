@@ -1,27 +1,53 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { exec } from "child_process";
-import Redis from "ioredis";
+import {Kafka} from "kafkajs"
 import mime from "mime";
 import path from "path";
 import fs from "fs";
 
+const DEPLOYMENT_ID = process.env.DEPLOYMENT_ID;
+const PROJECT_ID = process.env.PROJECT_ID;
 const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY;
 const accessKeyId = process.env.S3_ACCESS_KEY_ID;
-const PROJECT_ID = process.env.PROJECT_ID;
 const endpoint = process.env.S3_ENDPOINT;
-const redis_URL = process.env.REDIS_URL;
 const bucket = process.env.BUCKET;
+const kafka_USERNAME = process.env.KAFKA_USERNAME;
+const kafka_PASSWORD = process.env.KAFKA_PASSWORD;
+const kafka_BROKERS = process.env.KAFKA_BROKERS;
 
-if (!accessKeyId || !secretAccessKey || !bucket || !endpoint || !redis_URL) {
-  throw new Error("Missing AWS credentials in environment variables.");
+if (!accessKeyId || !secretAccessKey || !bucket || !endpoint || !kafka_BROKERS || !kafka_USERNAME || !kafka_PASSWORD || !DEPLOYMENT_ID) {
+  throw new Error("Missing required environment variables.");
 }
 console.log(`Project ID : ${PROJECT_ID}`);
+console.log(`DeploymentID : ${DEPLOYMENT_ID}`);
 
-const publisher = new Redis(redis_URL);
+const kafka = new Kafka({
+  clientId: `build-server-${PROJECT_ID}`,
+  brokers: kafka_BROKERS.split(","),
+  ssl: {
+    ca: [fs.readFileSync(path.join(__dirname, "./kafka.pem"), "utf-8")],
+  },
+  sasl: {
+    username: kafka_USERNAME,
+    password: kafka_PASSWORD,
+    mechanism: "plain",
+  },
+});
 
-const PublishLog = (log: unknown) => {
+const producer = kafka.producer();
+
+const PublishLog =async (log: unknown) => {
   try {
-    publisher.publish(`logs:${PROJECT_ID}`, JSON.stringify({ log }));
+    await producer.send({
+      topic: "container-logs",
+      messages: [
+        {
+          key: "log",
+          value: JSON.stringify({ PROJECT_ID, DEPLOYMENT_ID, log }),
+        },
+      ],
+    });
+  
   } catch (e) {
     console.error("Failed to publish log:", e);
   }
@@ -40,11 +66,12 @@ const init = async () => {
   try {
     console.log("Executing Index.ts");
 
-    // Wait for Redis connection to establish
-    console.log("Waiting for Redis connection...");
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+    // Connect to Kafka producer
+    console.log("Connecting to Kafka...");
+    await producer.connect();
+    console.log("Kafka producer connected successfully");
 
-    PublishLog(`Build Started...`);
+    await PublishLog(`Build Started...`);
 
     const outDirPath = path.join(__dirname, "output");
 
@@ -59,22 +86,22 @@ const init = async () => {
 
     const p = exec(`cd ${outDirPath} && bun install && bun run build`);
 
-    p.stdout?.on("data", (data) => {
+    p.stdout?.on("data", async(data) => {
       console.log(`Data Section: ${data.toString()}`);
-      PublishLog(`Data : ${data.toString()}`);
+      await PublishLog(`Data : ${data.toString()}`);
     });
 
-    p.stderr?.on("data", (data) => {
+    p.stderr?.on("data", async (data) => {
       console.warn(`Build Warning/Info: ${data.toString()}`);
-      PublishLog(`Build Info: ${data.toString()}`);
+      await PublishLog(`Build Info: ${data.toString()}`);
     });
 
     p.on("close", async (code) => {
       console.log(`Script running done with exit code: ${code}`);
-      PublishLog(`Build complete with exit code: ${code}`);
+      await PublishLog(`Build complete with exit code: ${code}`);
 
       if (code !== 0) {
-        PublishLog(`Build failed with exit code: ${code}`);
+        await PublishLog(`Build failed with exit code: ${code}`);
         console.error(`Build failed with exit code: ${code}`);
         process.exit(1);
         return;
@@ -97,7 +124,7 @@ const init = async () => {
 
         for (const file of files) {
           try {
-            PublishLog(`Started to upload file ${file}`);
+            await PublishLog(`Started to upload file ${file}`);
 
             const absoluteFilePath = path.join(distFolderPath, file);
 
@@ -109,7 +136,7 @@ const init = async () => {
                 ? fs.readFileSync(absoluteFilePath)
                 : fs.createReadStream(absoluteFilePath);
 
-            PublishLog(`Uploading file ${file}`);
+            await PublishLog(`Uploading file ${file}`);
 
             const command = new PutObjectCommand({
               Bucket: bucket,
@@ -118,32 +145,32 @@ const init = async () => {
               ContentType: mime.getType(absoluteFilePath) || undefined,
             });
 
-            PublishLog(`Uploaded file ${file}`);
+            await PublishLog(`Uploaded file ${file}`);
 
             await s3Client.send(command);
           } catch (uploadError) {
             console.error(`Error uploading file ${file}:`, uploadError);
-            PublishLog(`Error uploading file ${file}: ${uploadError}`);
+            await PublishLog(`Error uploading file ${file}: ${uploadError}`);
           }
         }
         console.log("Uploading done!");
-        PublishLog(`All files uploaded successfully!`);
+        await PublishLog(`All files uploaded successfully!`);
 
-        // Close Redis connection and exit
-        await publisher.quit();
+        // Close Kafka connection and exit
+        await producer.disconnect();
         console.log("Build process completed successfully. Exiting...");
         process.exit(0);
       } catch (distError) {
         console.error("Error processing dist folder:", distError);
-        PublishLog(`Error processing dist folder: ${distError}`);
-        await publisher.quit();
+        await PublishLog(`Error processing dist folder: ${distError}`);
+        await producer.disconnect();
         process.exit(1);
       }
     });
   } catch (err) {
     console.error("Error in init function:", err);
-    PublishLog(`Init function error: ${err}`);
-    await publisher.quit();
+    await PublishLog(`Init function error: ${err}`);
+    await producer.disconnect();
     process.exit(1);
   }
 };

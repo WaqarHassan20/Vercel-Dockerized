@@ -1,43 +1,79 @@
+import { PrismaClient } from "./generated/prisma";
 import { generateSlug } from "random-word-slugs";
+import { createClient } from "@clickhouse/client";
 import * as k8s from "@kubernetes/client-node";
 import { createServer } from "http";
+import { v4 as uuidv4 } from "uuid";
 import { Server } from "socket.io";
+import { Kafka } from "kafkajs";
 import express from "express";
-import Redis from "ioredis";
+import { z } from "zod";
+import path from "path";
+import cors from "cors";
 import "dotenv/config";
+import fs from "fs";
 
 const accessKeyId = process.env.S3_ACCESS_KEY_ID;
 const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY;
 const endpoint = process.env.S3_ENDPOINT;
-const redis_URL = process.env.REDIS_URL;
+const clickhouse_URL = process.env.CLICKHOUSE_URL;
+const clickhouse_USERNAME = process.env.CLICKHOUSE_USERNAME;
+const clickhouse_PASSWORD = process.env.CLICKHOUSE_PASSWORD;
+const kafka_USERNAME = process.env.KAFKA_USERNAME;
+const kafka_PASSWORD = process.env.KAFKA_PASSWORD;
+const kafka_BROKERS = process.env.KAFKA_BROKERS;
 const API_PORT = process.env.API_PORT || 9001;
 const bucket = process.env.BUCKET;
 
 if (
-  !accessKeyId ||
+  !clickhouse_USERNAME ||
+  !clickhouse_PASSWORD ||
+  !clickhouse_URL ||
+  !kafka_USERNAME ||
+  !kafka_PASSWORD ||
+  !kafka_BROKERS ||
   !secretAccessKey ||
+  !accessKeyId ||
   !endpoint ||
   !bucket ||
-  !redis_URL ||
   !API_PORT
 ) {
-  throw new Error("Missing AWS credentials in environment variables.");
+  throw new Error("Missing required environment variables.");
 }
 
-const subscriber = new Redis(redis_URL);
+const clickHouseClient = createClient({
+  host: clickhouse_URL,
+  username: clickhouse_USERNAME,
+  password: clickhouse_PASSWORD,
+  database: "default",
+});
 
+const kafka = new Kafka({
+  clientId: "api-server",
+  brokers: kafka_BROKERS.split(","),
+  ssl: {
+    ca: [fs.readFileSync(path.join(__dirname, "./kafka.pem"), "utf-8")],
+  },
+  sasl: {
+    username: kafka_USERNAME,
+    password: kafka_PASSWORD,
+    mechanism: "plain",
+  },
+});
+
+const consumer = kafka.consumer({ groupId: "api-server-logs-consumer" });
+
+const prismaClient = new PrismaClient();
 const app = express();
 app.use(express.json());
-
+app.use(cors());
 const httpServer = createServer(app);
-
 const io = new Server(httpServer, {
   cors: { origin: "*" },
 });
 
 io.on("connection", (socket) => {
   console.log("A connection established");
-
   socket.on("subscribe", (channel) => {
     console.log(`Client subscribing to channel: ${channel}`);
     socket.join(channel);
@@ -45,21 +81,109 @@ io.on("connection", (socket) => {
   });
 });
 
-// API Requests started form here
 app.post("/project", async (req, res) => {
+  const schema = z.object({
+    name: z.string(),
+    gitUrl: z.string(),
+  });
+
+  const parsedData = schema.safeParse(req.body);
+
+  if (!parsedData.success) {
+    res.status(400).send({
+      message: "Invalid Input Data",
+      Error: parsedData.error.format(),
+    });
+    return;
+  }
+
   try {
-    const { repoUrl, slug } = req.body;
+    const { name, gitUrl } = parsedData.data;
 
-    if (!repoUrl) {
-      return res.status(400).json({
-        error: "Github URL is required",
+    const project = await prismaClient.project.create({
+      data: {
+        name: name,
+        gitUrl: gitUrl,
+        subDomain: generateSlug(),
+      },
+    });
+
+    res.status(200).json({
+      message: "success",
+      data: project,
+    });
+  } catch (error) {
+    res.status(500).send({
+      message: "Some Error Occured",
+      Error: error,
+    });
+    return;
+  }
+});
+
+// API Requests started form here
+app.post("/deploy", async (req, res) => {
+  const schema = z.object({
+    projectId: z.string(),
+  });
+
+  const parsedData = schema.safeParse(req.body);
+  if (!parsedData.success) {
+    res.status(400).send({
+      message: "Invalid Input Data",
+      Error: parsedData.error.format(),
+    });
+    return;
+  }
+
+  try {
+    const { projectId } = parsedData.data;
+
+    const project = await prismaClient.project.findUnique({
+      where: {
+        id: projectId,
+      },
+    });
+
+    if (!project) {
+      res.status(400).send({
+        message: "Project not found",
       });
+      return;
     }
-    const PROJECT_ID = slug ? slug : generateSlug().toLowerCase();
 
-    console.log(`Repo URL is : ${repoUrl}`);
-    console.log(`ProjectId is : ${PROJECT_ID}`);
+    const deployment = await prismaClient.deployment.create({
+      data: {
+        project: { connect: { id: projectId } },
+        status: "QUEUED",
+      },
+    });
 
+    if (!deployment) {
+      res.status(400).send({
+        message: "Deployment not created",
+      });
+      return;
+    }
+
+    // Update deployment status to IN_PROGRESS
+    await prismaClient.deployment.update({
+      where: { id: deployment.id },
+      data: { status: "IN_PROGRESS" }
+    });
+
+    console.log(`Repo URL is : ${project.gitUrl}`);
+    console.log(`ProjectId is : ${projectId}`);
+
+    res.status(200).json({
+      status: "queued",
+      data: {
+        projectId,
+        deploymentId: deployment.id
+      }
+    });
+
+    // Continue with pod creation in background
     const kc = new k8s.KubeConfig();
     kc.loadFromDefault();
 
@@ -67,24 +191,27 @@ app.post("/project", async (req, res) => {
 
     // manifest code for pod in node js with env variables
     const podManifest = {
-      metadata: { name: `build-${PROJECT_ID}` },
+      metadata: { name: `build-${projectId}` },
       spec: {
         containers: [
           {
             name: "build-server",
-            image: "waqarhasan/build-server:v1.3",
+            image: "waqarhasan/build-server:v1.4",
             env: [
-              { name: "GIT_REPOSITORY_URL", value: repoUrl },
-              { name: "PROJECT_ID", value: PROJECT_ID },
-              { name: "S3_ACCESS_KEY_ID", value: accessKeyId },
+              { name: "GIT_REPOSITORY_URL", value: project.gitUrl },
+              { name: "PROJECT_ID", value: projectId },
+              { name: "DEPLOYMENT_ID", value: deployment.id },
+              { name: "S3_ACCESS_KEY_ID", value: accessKeyId }, // recently added
               {
                 name: "S3_SECRET_ACCESS_KEY",
                 value: secretAccessKey,
               },
               { name: "S3_ENDPOINT", value: endpoint },
               { name: "BUCKET", value: bucket },
-              { name: "REDIS_URL", value: redis_URL },
-              //   { name: "REDIS_URL", value: process.env.REDIS_URL },
+              { name: "KAFKA_BROKERS", value: kafka_BROKERS },
+              { name: "KAFKA_USERNAME", value: kafka_USERNAME },
+              { name: "KAFKA_PASSWORD", value: kafka_PASSWORD },
+              { name: "KAFKAJS_NO_PARTITIONER_WARNING", value: "1" },
             ],
           },
         ],
@@ -101,14 +228,8 @@ app.post("/project", async (req, res) => {
 
     console.log("Pod created successfully");
 
-    res.json({
-      slug: `${PROJECT_ID}`,
-      status: "build started",
-      url: `http://${PROJECT_ID}.localhost:8000`,
-    });
-
     // check the pod status while running in the background
-    const podName = `build-${PROJECT_ID}`;
+    const podName = `build-${projectId}`;
     let completed = false;
     let attempts = 0;
 
@@ -139,6 +260,13 @@ app.post("/project", async (req, res) => {
           console.log(
             `Pod ${podName} completed - Phase: ${phase}, Exit Code: ${exitCode}, Reason: ${reason}`
           );
+
+          // Update deployment status based on exit code
+          const finalStatus = exitCode === 0 ? "READY" : "FAIL";
+          await prismaClient.deployment.update({
+            where: { id: deployment.id },
+            data: { status: finalStatus }
+          });
 
           // Deleting the pod now
           try {
@@ -181,38 +309,84 @@ app.post("/project", async (req, res) => {
   }
 });
 
-async function initRedisSubscriber() {
-  console.log("Initializing Redis subscriber...");
-
+async function initKafkaConsumer() {
+  console.log("Initializing Kafka consumer...");
   try {
-    // Test Redis connection
-    subscriber.on("connect", () => {
-      console.log("Redis subscriber connected successfully");
-    });
+    await consumer.connect();
+    console.log("Kafka consumer connected successfully");
 
-    // Subscribe to all channels starting with 'logs:'
-    await subscriber.psubscribe("logs:*");
-    console.log("Subscribed to logs:* pattern");
+    await consumer.subscribe({ topics: ["container-logs"] });
+    console.log("Subscribed to container-logs topic");
 
-    // When a message is published in Redis, forward it to Socket.IO
-    subscriber.on("pmessage", (pattern, channel, message) => {
-      console.log(`${channel}: ${message}`);
-      // Emit to all sockets in the room
-      io.to(channel).emit("message", message);
-    });
+    await consumer.run({
+      autoCommit: false,
+      eachBatch: async ({
+        batch,
+        heartbeat,
+        commitOffsetsIfNecessary,
+        resolveOffset,
+      }) => {
+        try {
+          const messages = batch.messages;
+          console.log(`Recv. ${messages.length} messages`);
 
-    subscriber.on("error", (err) => {
-      console.error("Redis subscriber error:", err);
+          for (const message of messages) {
+            const stringMessage = message.value?.toString();
+
+            if (stringMessage) {
+              try {
+                // value: JSON.stringify({ PROJECT_ID, DEPLOYMENT_ID, log }),
+                // since puslisher is puslishing  data in that above format so,
+                // we are parsing it back in the object notation
+
+                const { PROJECT_ID, DEPLOYMENT_ID, log } =
+                  JSON.parse(stringMessage);
+
+                // Forward logs to Socket.IO clients subscribed to this project
+                io.to(`logs:${PROJECT_ID}`).emit("message", JSON.stringify({
+                  projectId: PROJECT_ID,
+                  deploymentId: DEPLOYMENT_ID,
+                  log: log,
+                  timestamp: new Date().toISOString()
+                }));
+
+                await clickHouseClient.insert({
+                  table: "log_event", // the name of table on aiven ck service
+                  values: [
+                    {
+                      event_id: uuidv4(),
+                      deployment_id: DEPLOYMENT_ID,
+                      log,
+                    },
+                  ],
+                  format: "JSONEachRow",
+                });
+              } catch (parseError) {
+                console.error("Error parsing message:", parseError);
+              }
+            }
+
+            resolveOffset(message.offset);
+            await commitOffsetsIfNecessary(message.offset as any);
+            await heartbeat();
+          }
+        } catch (err) {
+          console.error("Error while processing batch:", err);
+        }
+      },
     });
   } catch (error) {
-    console.error("Failed to initialize Redis subscriber:", error);
+    console.error("Failed to initialize Kafka consumer:", error);
+    // Retry connection after 5 seconds
+    setTimeout(() => {
+      console.log("Retrying Kafka connection...");
+      initKafkaConsumer();
+    }, 5000);
   }
 }
 
-// Initialize Redis subscriber immediately
-initRedisSubscriber();
+initKafkaConsumer();
 
-// Start a single server for both API and Socket.IO
 httpServer.listen(API_PORT, () => {
   console.log(`API Server + Socket.IO are listening on port ${API_PORT}`);
 });
