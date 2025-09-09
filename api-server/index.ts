@@ -9,7 +9,7 @@ import { z } from "zod";
 import path from "path";
 import cors from "cors";
 import "dotenv/config";
-import fs, { stat } from "fs";
+import fs from "fs";
 
 const accessKeyId = process.env.S3_ACCESS_KEY_ID;
 const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY;
