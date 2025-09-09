@@ -8,6 +8,10 @@ node_modules
 *.p12
 *.pfx
 
+# Prisma certificates
+prisma/*.pem
+prisma/ca.pem
+
 # output
 out
 dist
