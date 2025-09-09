@@ -2,36 +2,30 @@ import { PrismaClient } from "./generated/prisma";
 import { generateSlug } from "random-word-slugs";
 import { createClient } from "@clickhouse/client";
 import * as k8s from "@kubernetes/client-node";
-import { createServer } from "http";
 import { v4 as uuidv4 } from "uuid";
-import { Server } from "socket.io";
 import { Kafka } from "kafkajs";
 import express from "express";
 import { z } from "zod";
 import path from "path";
 import cors from "cors";
 import "dotenv/config";
-import fs from "fs";
+import fs, { stat } from "fs";
 
 const accessKeyId = process.env.S3_ACCESS_KEY_ID;
 const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY;
 const endpoint = process.env.S3_ENDPOINT;
 const clickhouse_URL = process.env.CLICKHOUSE_URL;
-const clickhouse_USERNAME = process.env.CLICKHOUSE_USERNAME;
-const clickhouse_PASSWORD = process.env.CLICKHOUSE_PASSWORD;
 const kafka_USERNAME = process.env.KAFKA_USERNAME;
 const kafka_PASSWORD = process.env.KAFKA_PASSWORD;
-const kafka_BROKERS = process.env.KAFKA_BROKERS;
+const kafka_BROKERS_URL = process.env.KAFKA_BROKERS;
 const API_PORT = process.env.API_PORT || 9001;
 const bucket = process.env.BUCKET;
 
 if (
-  !clickhouse_USERNAME ||
-  !clickhouse_PASSWORD ||
   !clickhouse_URL ||
   !kafka_USERNAME ||
   !kafka_PASSWORD ||
-  !kafka_BROKERS ||
+  !kafka_BROKERS_URL ||
   !secretAccessKey ||
   !accessKeyId ||
   !endpoint ||
@@ -41,45 +35,113 @@ if (
   throw new Error("Missing required environment variables.");
 }
 
-const clickHouseClient = createClient({
-  host: clickhouse_URL,
-  username: clickhouse_USERNAME,
-  password: clickhouse_PASSWORD,
-  database: "default",
-});
+const prismaClient = new PrismaClient();
+const app = express();
+app.use(express.json());
+app.use(cors());
+
 
 const kafka = new Kafka({
   clientId: "api-server",
-  brokers: kafka_BROKERS.split(","),
+  brokers: [kafka_BROKERS_URL],
   ssl: {
     ca: [fs.readFileSync(path.join(__dirname, "./kafka.pem"), "utf-8")],
   },
+
   sasl: {
     username: kafka_USERNAME,
     password: kafka_PASSWORD,
     mechanism: "plain",
   },
+  retry: {
+    retries: 5, // Retry up to 5 times
+    initialRetryTime: 300, // Start with 300ms retry delay
+    maxRetryTime: 10000, // Maximum retry with a delay of 10 seconds
+  },
+  requestTimeout: 30000, // 30s time for requests
 });
+
 
 const consumer = kafka.consumer({ groupId: "api-server-logs-consumer" });
 
-const prismaClient = new PrismaClient();
-const app = express();
-app.use(express.json());
-app.use(cors());
-const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: { origin: "*" },
+const clickHouseClient = createClient({
+  url: clickhouse_URL,
+  database: "default",
 });
 
-io.on("connection", (socket) => {
-  console.log("A connection established");
-  socket.on("subscribe", (channel) => {
-    console.log(`Client subscribing to channel: ${channel}`);
-    socket.join(channel);
-    socket.emit("message", `Joined ${channel}`);
-  });
-});
+
+async function initKafkaConsumer() {
+  console.log("Initializing Kafka consumer...");
+  try {
+    await consumer.connect();
+    console.log("Kafka consumer connected successfully");
+
+    await consumer.subscribe({ topics: ["container-logs"] });
+    console.log("Subscribed to container-logs topic");
+
+    await consumer.run({
+      autoCommit: false,
+      eachBatch: async ({
+        batch,
+        heartbeat,
+        commitOffsetsIfNecessary,
+        resolveOffset,
+      }) => {
+        try {
+          const messages = batch.messages;
+          console.log(`Recv. ${messages.length} messages`);
+
+          for (const message of messages) {
+            const stringMessage = message.value?.toString();
+
+            if (stringMessage) {
+              try {
+                // value: JSON.stringify({ PROJECT_ID, DEPLOYMENT_ID, log }),
+                // since puslisher is puslishing  data in that above format so,
+                // we are parsing it back in the object notation
+
+                const { PROJECT_ID, DEPLOYMENT_ID, log } =
+                  JSON.parse(stringMessage);
+
+                const { query_id } = await clickHouseClient.insert({
+                  table: "log_events", // the name of table on aiven ck service
+                  values: [
+                    {
+                      event_id: uuidv4(),
+                      deployment_id: DEPLOYMENT_ID,
+                      log,
+                    },
+                  ],
+                  format: "JSONEachRow",
+                });
+
+                console.log(query_id);
+                resolveOffset(message.offset);
+                await commitOffsetsIfNecessary(message.offset as any);
+                await heartbeat();
+
+              } catch (parseError) {
+                console.error("Error parsing message:", parseError);
+              }
+            }
+          }
+        } catch (err) {
+          console.error("Error while processing batch:", err);
+        }
+      },
+    });
+  } catch (error) {
+    console.error("Failed to initialize Kafka consumer:", error);
+    // Retry connection after 5 seconds
+    setTimeout(() => {
+      console.log("Retrying Kafka connection...");
+      initKafkaConsumer();
+    }, 5000);
+  }
+}
+
+initKafkaConsumer();
+
 
 app.post("/project", async (req, res) => {
   const schema = z.object({
@@ -108,10 +170,14 @@ app.post("/project", async (req, res) => {
       },
     });
 
-    res.status(200).json({
-      message: "success",
-      data: project,
-    });
+    if (project) {
+      res.status(200).json({
+        message: "success",
+        data: project,
+      });
+    }
+
+    console.log("Project route success");
   } catch (error) {
     res.status(500).send({
       message: "Some Error Occured",
@@ -161,7 +227,7 @@ app.post("/deploy", async (req, res) => {
 
     if (!deployment) {
       res.status(400).send({
-        message: "Deployment not created",
+        message: "Error creating deployment",
       });
       return;
     }
@@ -169,18 +235,16 @@ app.post("/deploy", async (req, res) => {
     // Update deployment status to IN_PROGRESS
     await prismaClient.deployment.update({
       where: { id: deployment.id },
-      data: { status: "IN_PROGRESS" }
+      data: { status: "IN_PROGRESS" },
     });
 
-    console.log(`Repo URL is : ${project.gitUrl}`);
-    console.log(`ProjectId is : ${projectId}`);
 
     res.status(200).json({
       status: "queued",
       data: {
         projectId,
-        deploymentId: deployment.id
-      }
+        deploymentId: deployment.id,
+      },
     });
 
     // Continue with pod creation in background
@@ -196,7 +260,7 @@ app.post("/deploy", async (req, res) => {
         containers: [
           {
             name: "build-server",
-            image: "waqarhasan/build-server:v1.4",
+            image: "waqarhasan/build-server:v1.8",
             env: [
               { name: "GIT_REPOSITORY_URL", value: project.gitUrl },
               { name: "PROJECT_ID", value: projectId },
@@ -208,7 +272,7 @@ app.post("/deploy", async (req, res) => {
               },
               { name: "S3_ENDPOINT", value: endpoint },
               { name: "BUCKET", value: bucket },
-              { name: "KAFKA_BROKERS", value: kafka_BROKERS },
+              { name: "KAFKA_BROKERS", value: kafka_BROKERS_URL },
               { name: "KAFKA_USERNAME", value: kafka_USERNAME },
               { name: "KAFKA_PASSWORD", value: kafka_PASSWORD },
               { name: "KAFKAJS_NO_PARTITIONER_WARNING", value: "1" },
@@ -265,7 +329,7 @@ app.post("/deploy", async (req, res) => {
           const finalStatus = exitCode === 0 ? "READY" : "FAIL";
           await prismaClient.deployment.update({
             where: { id: deployment.id },
-            data: { status: finalStatus }
+            data: { status: finalStatus },
           });
 
           // Deleting the pod now
@@ -309,84 +373,33 @@ app.post("/deploy", async (req, res) => {
   }
 });
 
-async function initKafkaConsumer() {
-  console.log("Initializing Kafka consumer...");
+app.get("/logs/:id", async (req, res) => {
   try {
-    await consumer.connect();
-    console.log("Kafka consumer connected successfully");
+    const id = req.params.id;
 
-    await consumer.subscribe({ topics: ["container-logs"] });
-    console.log("Subscribed to container-logs topic");
-
-    await consumer.run({
-      autoCommit: false,
-      eachBatch: async ({
-        batch,
-        heartbeat,
-        commitOffsetsIfNecessary,
-        resolveOffset,
-      }) => {
-        try {
-          const messages = batch.messages;
-          console.log(`Recv. ${messages.length} messages`);
-
-          for (const message of messages) {
-            const stringMessage = message.value?.toString();
-
-            if (stringMessage) {
-              try {
-                // value: JSON.stringify({ PROJECT_ID, DEPLOYMENT_ID, log }),
-                // since puslisher is puslishing  data in that above format so,
-                // we are parsing it back in the object notation
-
-                const { PROJECT_ID, DEPLOYMENT_ID, log } =
-                  JSON.parse(stringMessage);
-
-                // Forward logs to Socket.IO clients subscribed to this project
-                io.to(`logs:${PROJECT_ID}`).emit("message", JSON.stringify({
-                  projectId: PROJECT_ID,
-                  deploymentId: DEPLOYMENT_ID,
-                  log: log,
-                  timestamp: new Date().toISOString()
-                }));
-
-                await clickHouseClient.insert({
-                  table: "log_event", // the name of table on aiven ck service
-                  values: [
-                    {
-                      event_id: uuidv4(),
-                      deployment_id: DEPLOYMENT_ID,
-                      log,
-                    },
-                  ],
-                  format: "JSONEachRow",
-                });
-              } catch (parseError) {
-                console.error("Error parsing message:", parseError);
-              }
-            }
-
-            resolveOffset(message.offset);
-            await commitOffsetsIfNecessary(message.offset as any);
-            await heartbeat();
-          }
-        } catch (err) {
-          console.error("Error while processing batch:", err);
-        }
+    const logs = await clickHouseClient.query({
+      query: `
+        SELECT event_id, deployment_id, log, timestamp
+        FROM log_events
+        WHERE deployment_id = {deployment_id:String}
+      `,
+      query_params: {
+        deployment_id: id,
       },
+      format: "JSON",
+    });
+
+    const objectLogs = await logs.json();
+
+    res.status(200).json({
+      logs: objectLogs.data,
     });
   } catch (error) {
-    console.error("Failed to initialize Kafka consumer:", error);
-    // Retry connection after 5 seconds
-    setTimeout(() => {
-      console.log("Retrying Kafka connection...");
-      initKafkaConsumer();
-    }, 5000);
+    console.error("Error fetching logs:", error);
+    res.status(500).json({ error: "Failed to fetch logs" });
   }
-}
+});
 
-initKafkaConsumer();
-
-httpServer.listen(API_PORT, () => {
-  console.log(`API Server + Socket.IO are listening on port ${API_PORT}`);
+app.listen(API_PORT, () => {
+  console.log(`API Server is listening on port ${API_PORT}`);
 });

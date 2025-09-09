@@ -1,6 +1,15 @@
 # dependencies (bun install)
 node_modules
 
+# SSL certificates and keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+kafka.pem
+
 # output
 out
 dist

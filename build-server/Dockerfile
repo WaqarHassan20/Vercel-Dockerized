@@ -9,7 +9,7 @@ RUN apk add --no-cache git ca-certificates && update-ca-certificates
 
 # Copy package.json and install dependencies
 COPY package.json ./
-COPY kafka.pem kafka.pem 
+COPY kafka.pem ./ 
 
 RUN bun install
 

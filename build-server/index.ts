@@ -23,9 +23,11 @@ console.log(`DeploymentID : ${DEPLOYMENT_ID}`);
 
 const kafka = new Kafka({
   clientId: `build-server-${PROJECT_ID}`,
-  brokers: kafka_BROKERS.split(","),
+  // brokers: kafka_BROKERS.split(","),  // make sure it's an array
+  brokers: [kafka_BROKERS],
   ssl: {
-    ca: [fs.readFileSync(path.join(__dirname, "./kafka.pem"), "utf-8")],
+    rejectUnauthorized: false,
+    ca: [fs.readFileSync(path.join(__dirname, "kafka.pem"), "utf-8")],
   },
   sasl: {
     username: kafka_USERNAME,

@@ -1,6 +1,13 @@
 # dependencies (bun install)
 node_modules
 
+# SSL certificates and keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
 # output
 out
 dist
